@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use actix_web::{cookie::{time::Duration, CookieBuilder, SameSite}, post, web, App, HttpResponse, HttpServer};
+use actix_web::{cookie::{time::Duration, CookieBuilder, SameSite}, post, web::{self, Data}, App, HttpResponse, HttpServer};
 use alcoholic_jwt::{token_kid, Validation, JWKS};
+use config::{Config, FileFormat};
 use serde::Deserialize;
 
 
@@ -19,6 +20,16 @@ struct TokenData{
     _token_type: String
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct AuthConfig{
+    domain: String,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    token_endpoint: String,
+    jwks_endpoint: String
+}
+
 
 async fn jwks_fetching_function(url: &str) -> JWKS{
     let body = reqwest::get(url).await.unwrap().text().await.unwrap();
@@ -26,26 +37,25 @@ async fn jwks_fetching_function(url: &str) -> JWKS{
 }
 
 #[post("/auth")]
-async fn auth_code(auth: web::Json<Authorization>) -> HttpResponse{
+async fn auth_code(auth: web::Json<Authorization>, auth_config: web::Data<AuthConfig>) -> HttpResponse{
     let client = reqwest::Client::new();
-    let url = "https://dev-g4v4xush624yyr7l.us.auth0.com/oauth/token/";
 
     let mut params = HashMap::new();
     params.insert("grant_type", "authorization_code");
-    params.insert("client_id", "------");
-    params.insert("client_secret", "------");
-    params.insert("redirect_uri", "http://localhost:8000/redirect.html");
+    params.insert("client_id", &auth_config.client_id);
+    params.insert("client_secret", &auth_config.client_secret);
+    params.insert("redirect_uri", &auth_config.redirect_uri);
     params.insert("code", &auth.code);
 
     let token_data: TokenData;
-    match client.post(url).form(&params).send().await{
+    match client.post(&auth_config.token_endpoint).form(&params).send().await{
         Ok(resp) => {
             token_data = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
 
-            let jwks: JWKS = jwks_fetching_function("https://dev-g4v4xush624yyr7l.us.auth0.com/.well-known/jwks.json").await;
+            let jwks: JWKS = jwks_fetching_function(&auth_config.jwks_endpoint).await;
             let validations = vec![
-                Validation::Issuer("https://dev-g4v4xush624yyr7l.us.auth0.com/".into()),
-                Validation::Audience("vgz6FLZvvBBlQ4AdGS1arjZHPIm9RIii".into())
+                Validation::Issuer(auth_config.domain.clone().into()),
+                Validation::Audience(auth_config.client_id.clone().into())
             ];
 
             let kid = token_kid(&token_data.id_token)
@@ -83,9 +93,26 @@ async fn auth_code(auth: web::Json<Authorization>) -> HttpResponse{
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()>{
-    HttpServer::new(|| { 
+    let auth_settings = Config::builder()
+        .add_source(config::File::new("config", FileFormat::Json))
+        .build();
+
+    let auth_config: AuthConfig;
+    match auth_settings{
+        Ok(setting) => {
+            auth_config = setting.try_deserialize::<AuthConfig>().unwrap();
+        }
+
+        Err(e) => {
+            println!("{:#?}", e);
+            std::process::exit(1)
+        }
+    }
+
+    HttpServer::new(move || { 
         App::new()
             .service(auth_code)
+            .app_data(Data::new(auth_config.clone()))
     })
     .bind(("localhost", 8080))?
     .run()
